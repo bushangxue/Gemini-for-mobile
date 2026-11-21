@@ -3,15 +3,26 @@ package com.local.geminiwrapper
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.DownloadManager
+import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Message
+import android.provider.MediaStore
+import android.text.InputType
+import android.util.Base64
 import android.view.View
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -20,6 +31,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -27,19 +39,33 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.webkit.ProxyConfig
+import androidx.webkit.ProxyController
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
+import com.google.android.material.floatingactionbutton.FloatingActionButton
+import com.google.android.material.switchmaterial.SwitchMaterial
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val GEMINI_URL = "https://gemini.google.com/app"
+        private const val PREFS_NAME = "gemini_wrapper_prefs"
+        private const val KEY_PROXY_ENABLED = "proxy_enabled"
+        private const val KEY_PROXY_HOST = "proxy_host"
+        private const val KEY_PROXY_PORT = "proxy_port"
+        private const val DEFAULT_PROXY_PORT = "7890"
 
-        // 允许在 App 内直接打开的域名（Gemini 本体与 Google 登录认证链路）
         private val IN_APP_HOST_SUFFIXES = listOf(
             "gemini.google.com",
             "accounts.google.com",
@@ -58,12 +84,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var errorView: LinearLayout
     private lateinit var errorMessage: TextView
     private lateinit var retryButton: Button
+    private lateinit var errorProxyButton: Button
+    private lateinit var menuFab: FloatingActionButton
 
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private var pendingWebPermissionRequest: PermissionRequest? = null
     private var lastBackPressedTime: Long = 0L
+    private var isDesktopMode: Boolean = false
+    private var defaultMobileUa: String = ""
 
-    // 文件/图片选择器回调（支持多选上传图片与文档）
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -88,7 +119,6 @@ class MainActivity : AppCompatActivity() {
         callback.onReceiveValue(if (uris.isNotEmpty()) uris.toTypedArray() else null)
     }
 
-    // 麦克风与摄像头运行时权限回调（用于语音对话）
     private val mediaPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
@@ -133,24 +163,32 @@ class MainActivity : AppCompatActivity() {
         errorView = findViewById(R.id.errorView)
         errorMessage = findViewById(R.id.errorMessage)
         retryButton = findViewById(R.id.retryButton)
+        errorProxyButton = findViewById(R.id.errorProxyButton)
+        menuFab = findViewById(R.id.menuFab)
 
         retryButton.setOnClickListener {
-            errorView.visibility = View.GONE
-            webView.visibility = View.VISIBLE
-            if (webView.url.isNullOrBlank()) {
-                webView.loadUrl(GEMINI_URL)
-            } else {
-                webView.reload()
-            }
+            reloadPage()
+        }
+
+        errorProxyButton.setOnClickListener {
+            showProxySettingsDialog()
+        }
+
+        menuFab.setOnClickListener {
+            showQuickMenuDialog()
         }
 
         setupWebView()
+        setupLongPressImageSave()
         setupBackNavigation()
 
-        if (savedInstanceState != null) {
-            webView.restoreState(savedInstanceState)
-        } else {
-            webView.loadUrl(GEMINI_URL)
+        // 启动时优先应用 App 内独立代理配置，再加载页面
+        applySavedProxy {
+            if (savedInstanceState != null) {
+                webView.restoreState(savedInstanceState)
+            } else {
+                webView.loadUrl(GEMINI_URL)
+            }
         }
     }
 
@@ -176,13 +214,19 @@ class MainActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
             cacheMode = WebSettings.LOAD_DEFAULT
 
-            // 关键：移除默认 WebView UA 中的 "; wv" 与 "Version/x.x" 标识，
-            // 降低触发 Google 登录 403 disallowed_useragent 拦截的概率
-            userAgentString = buildSanitizedUserAgent(userAgentString)
+            defaultMobileUa = buildSanitizedUserAgent(userAgentString)
+            userAgentString = defaultMobileUa
         }
 
         if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
             WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, true)
+        }
+
+        // 注册 Blob/DataURL 下载桥接
+        webView.addJavascriptInterface(DownloadBridge(), "AndroidDownloadBridge")
+
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            handleFileDownload(url, userAgent, contentDisposition, mimeType)
         }
 
         webView.webViewClient = object : WebViewClient() {
@@ -197,7 +241,6 @@ class MainActivity : AppCompatActivity() {
                     return false
                 }
 
-                // 外部引用链接交由系统浏览器打开，避免打断当前对话
                 openExternalUrl(uri)
                 return true
             }
@@ -221,13 +264,13 @@ class MainActivity : AppCompatActivity() {
                 error: WebResourceError?
             ) {
                 super.onReceivedError(view, request, error)
-                // 仅在主框架加载失败时展示错误页
                 if (request?.isForMainFrame == true) {
                     progressBar.visibility = View.GONE
                     webView.visibility = View.GONE
                     errorView.visibility = View.VISIBLE
                     val desc = error?.description?.toString() ?: "网络连接失败"
-                    errorMessage.text = "无法连接到 Gemini 网页端\n($desc)\n请检查网络或代理设置后重试"
+                    val proxyHint = getProxyStatusLabel()
+                    errorMessage.text = "无法连接到 Gemini 网页端\n($desc)\n当前代理状态：$proxyHint"
                 }
             }
         }
@@ -316,7 +359,6 @@ class MainActivity : AppCompatActivity() {
                     return false
                 }
 
-                // 兼容 target="_blank" 或登录弹窗
                 val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
                 val tempWebView = WebView(this@MainActivity)
                 tempWebView.webViewClient = object : WebViewClient() {
@@ -340,6 +382,390 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    // ==================== App 内独立代理 (ProxyController) ====================
+
+    private fun getProxyStatusLabel(): String {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val enabled = prefs.getBoolean(KEY_PROXY_ENABLED, false)
+        val host = prefs.getString(KEY_PROXY_HOST, "").orEmpty().trim()
+        val port = prefs.getString(KEY_PROXY_PORT, DEFAULT_PROXY_PORT).orEmpty().trim()
+        return if (enabled && host.isNotEmpty() && port.isNotEmpty()) {
+            "已开启 ($host:$port)"
+        } else {
+            "未开启（直连）"
+        }
+    }
+
+    private fun applySavedProxy(onDone: () -> Unit) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+            onDone()
+            return
+        }
+
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val enabled = prefs.getBoolean(KEY_PROXY_ENABLED, false)
+        val host = prefs.getString(KEY_PROXY_HOST, "").orEmpty().trim()
+        val port = prefs.getString(KEY_PROXY_PORT, DEFAULT_PROXY_PORT).orEmpty().trim()
+        val mainExecutor = ContextCompat.getMainExecutor(this)
+
+        if (enabled && host.isNotEmpty() && port.isNotEmpty()) {
+            try {
+                val proxyConfig = ProxyConfig.Builder()
+                    .addProxyRule("http://$host:$port")
+                    .bypassSimpleHostnames()
+                    .build()
+                ProxyController.getInstance().setProxyOverride(proxyConfig, mainExecutor) {
+                    onDone()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "代理格式有误：${e.message}", Toast.LENGTH_SHORT).show()
+                onDone()
+            }
+        } else {
+            ProxyController.getInstance().clearProxyOverride(mainExecutor) {
+                onDone()
+            }
+        }
+    }
+
+    private fun showProxySettingsDialog() {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+            Toast.makeText(this, "当前手机系统 WebView 版本过低，不支持应用内独立代理", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val currentEnabled = prefs.getBoolean(KEY_PROXY_ENABLED, false)
+        val currentHost = prefs.getString(KEY_PROXY_HOST, "").orEmpty()
+        val currentPort = prefs.getString(KEY_PROXY_PORT, DEFAULT_PROXY_PORT).orEmpty()
+
+        val dp = resources.displayMetrics.density
+        val pad = (20 * dp).toInt()
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, 0)
+        }
+
+        val switchView = SwitchMaterial(this).apply {
+            text = "启用 App 内独立 HTTP 代理"
+            isChecked = currentEnabled
+        }
+
+        val hostInput = EditText(this).apply {
+            hint = "电脑局域网 IP（如 192.168.1.105）"
+            setText(currentHost)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+
+        val portInput = EditText(this).apply {
+            hint = "HTTP 端口（默认 7890）"
+            setText(currentPort)
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+
+        val tipView = TextView(this).apply {
+            text = "提示：仅对本 App 生效，不会影响手机 Wi-Fi 和其他应用联网。"
+            textSize = 12f
+            setPadding(0, (8 * dp).toInt(), 0, 0)
+        }
+
+        container.addView(switchView)
+        container.addView(hostInput)
+        container.addView(portInput)
+        container.addView(tipView)
+
+        AlertDialog.Builder(this)
+            .setTitle("App 内独立代理设置")
+            .setView(container)
+            .setPositiveButton("保存并刷新") { _, _ ->
+                val enabled = switchView.isChecked
+                val host = hostInput.text.toString().trim()
+                val port = portInput.text.toString().trim().ifEmpty { DEFAULT_PROXY_PORT }
+
+                if (enabled && host.isEmpty()) {
+                    Toast.makeText(this, "启用代理时请填写电脑 IP 地址", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
+                prefs.edit()
+                    .putBoolean(KEY_PROXY_ENABLED, enabled)
+                    .putString(KEY_PROXY_HOST, host)
+                    .putString(KEY_PROXY_PORT, port)
+                    .apply()
+
+                applySavedProxy {
+                    Toast.makeText(this, "代理设置已更新：${getProxyStatusLabel()}", Toast.LENGTH_SHORT).show()
+                    reloadPage()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun showQuickMenuDialog() {
+        val desktopLabel = if (isDesktopMode) "切换回手机版页面" else "切换为桌面版页面（适合宽表格）"
+        val items = arrayOf(
+            "App 内独立代理（${getProxyStatusLabel()}）",
+            "刷新当前页面",
+            "回到 Gemini 首页",
+            desktopLabel
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle("Gemini 快捷工具")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> showProxySettingsDialog()
+                    1 -> reloadPage()
+                    2 -> {
+                        errorView.visibility = View.GONE
+                        webView.visibility = View.VISIBLE
+                        webView.loadUrl(GEMINI_URL)
+                    }
+                    3 -> toggleDesktopMode()
+                }
+            }
+            .show()
+    }
+
+    private fun toggleDesktopMode() {
+        isDesktopMode = !isDesktopMode
+        webView.settings.userAgentString = if (isDesktopMode) {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        } else {
+            defaultMobileUa
+        }
+        reloadPage()
+    }
+
+    private fun reloadPage() {
+        errorView.visibility = View.GONE
+        webView.visibility = View.VISIBLE
+        if (webView.url.isNullOrBlank()) {
+            webView.loadUrl(GEMINI_URL)
+        } else {
+            webView.reload()
+        }
+    }
+
+    // ==================== 长按保存图片到相册 ====================
+
+    private fun setupLongPressImageSave() {
+        webView.setOnLongClickListener {
+            val result = webView.hitTestResult
+            val type = result.type
+            val imageUrl = result.extra
+            if ((type == WebView.HitTestResult.IMAGE_TYPE ||
+                    type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) &&
+                !imageUrl.isNullOrBlank()
+            ) {
+                AlertDialog.Builder(this)
+                    .setTitle("图片操作")
+                    .setItems(arrayOf("保存图片到相册", "在外部浏览器打开图片")) { _, which ->
+                        when (which) {
+                            0 -> saveImageToGallery(imageUrl)
+                            1 -> openExternalUrl(Uri.parse(imageUrl))
+                        }
+                    }
+                    .show()
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    private fun saveImageToGallery(imageUrl: String) {
+        when {
+            imageUrl.startsWith("data:", ignoreCase = true) -> {
+                ioExecutor.execute {
+                    saveDataUrl(imageUrl, "Gemini_${System.currentTimeMillis()}.png", isImage = true)
+                }
+            }
+            imageUrl.startsWith("blob:", ignoreCase = true) -> {
+                fetchBlobViaJs(imageUrl, "Gemini_${System.currentTimeMillis()}.png", "image/png", isImage = true)
+            }
+            else -> {
+                Toast.makeText(this, "正在保存图片...", Toast.LENGTH_SHORT).show()
+                val cookie = CookieManager.getInstance().getCookie(imageUrl).orEmpty()
+                val ua = webView.settings.userAgentString
+                ioExecutor.execute {
+                    try {
+                        val conn = (URL(imageUrl).openConnection() as HttpURLConnection).apply {
+                            requestMethod = "GET"
+                            connectTimeout = 15000
+                            readTimeout = 20000
+                            if (cookie.isNotEmpty()) setRequestProperty("Cookie", cookie)
+                            setRequestProperty("User-Agent", ua)
+                        }
+                        val contentType = conn.contentType?.substringBefore(";")?.trim().orEmpty()
+                        val mime = if (contentType.startsWith("image/")) contentType else "image/png"
+                        val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: "png"
+                        val bytes = conn.inputStream.use { it.readBytes() }
+                        conn.disconnect()
+
+                        val fileName = "Gemini_${System.currentTimeMillis()}.$ext"
+                        writeBytesToStorage(bytes, fileName, mime, isImage = true)
+                    } catch (e: Exception) {
+                        runOnUiThread {
+                            Toast.makeText(this, "保存图片失败：${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== 文件下载支持（HTTP / DataURL / Blob） ====================
+
+    private fun handleFileDownload(
+        url: String,
+        userAgent: String,
+        contentDisposition: String,
+        mimeType: String
+    ) {
+        val guessedName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+            .ifBlank { "gemini_file_${System.currentTimeMillis()}" }
+
+        when {
+            url.startsWith("blob:", ignoreCase = true) -> {
+                fetchBlobViaJs(url, guessedName, mimeType.ifBlank { "application/octet-stream" }, isImage = false)
+            }
+            url.startsWith("data:", ignoreCase = true) -> {
+                ioExecutor.execute {
+                    saveDataUrl(url, guessedName, isImage = mimeType.startsWith("image/"))
+                }
+            }
+            else -> {
+                try {
+                    val request = DownloadManager.Request(Uri.parse(url)).apply {
+                        setMimeType(mimeType)
+                        val cookie = CookieManager.getInstance().getCookie(url)
+                        if (!cookie.isNullOrBlank()) {
+                            addRequestHeader("Cookie", cookie)
+                        }
+                        addRequestHeader("User-Agent", userAgent)
+                        setTitle(guessedName)
+                        setDescription("正在下载文件...")
+                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, guessedName)
+                    }
+                    val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                    dm.enqueue(request)
+                    Toast.makeText(this, "已开始下载：$guessedName", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "下载失败：${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun fetchBlobViaJs(blobUrl: String, fileName: String, mimeType: String, isImage: Boolean) {
+        val escapedUrl = blobUrl.replace("\\", "\\\\").replace("'", "\\'")
+        val escapedName = fileName.replace("\\", "\\\\").replace("'", "\\'")
+        val escapedMime = mimeType.replace("\\", "\\\\").replace("'", "\\'")
+        val js = """
+            (function() {
+                fetch('$escapedUrl')
+                    .then(function(res) { return res.blob(); })
+                    .then(function(blob) {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            AndroidDownloadBridge.saveBase64File(reader.result, '$escapedName', '$escapedMime', $isImage);
+                        };
+                        reader.readAsDataURL(blob);
+                    })
+                    .catch(function(err) {
+                        AndroidDownloadBridge.onError(String(err));
+                    });
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    private inner class DownloadBridge {
+        @JavascriptInterface
+        fun saveBase64File(dataUrl: String, fileName: String, mimeType: String, isImage: Boolean) {
+            ioExecutor.execute {
+                saveDataUrl(dataUrl, fileName, isImage, mimeType)
+            }
+        }
+
+        @JavascriptInterface
+        fun onError(message: String) {
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "保存失败：$message", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun saveDataUrl(
+        dataUrl: String,
+        fileName: String,
+        isImage: Boolean,
+        fallbackMime: String = "application/octet-stream"
+    ) {
+        try {
+            val commaIdx = dataUrl.indexOf(',')
+            if (commaIdx == -1) return
+            val meta = dataUrl.substring(5, commaIdx) // 去掉 "data:"
+            val detectedMime = meta.substringBefore(";").ifBlank { fallbackMime }
+            val base64Part = dataUrl.substring(commaIdx + 1)
+            val bytes = Base64.decode(base64Part, Base64.DEFAULT)
+            writeBytesToStorage(bytes, fileName, detectedMime, isImage)
+        } catch (e: Exception) {
+            runOnUiThread {
+                Toast.makeText(this, "解析并保存失败：${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun writeBytesToStorage(
+        bytes: ByteArray,
+        fileName: String,
+        mimeType: String,
+        isImage: Boolean
+    ) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                    put(
+                        MediaStore.MediaColumns.RELATIVE_PATH,
+                        if (isImage) "${Environment.DIRECTORY_PICTURES}/Gemini" else Environment.DIRECTORY_DOWNLOADS
+                    )
+                }
+                val collection = if (isImage) {
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                } else {
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                }
+                val uri = contentResolver.insert(collection, values)
+                    ?: throw IllegalStateException("无法创建系统媒体存储项")
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            } else {
+                val dir = Environment.getExternalStoragePublicDirectory(
+                    if (isImage) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS
+                )
+                if (!dir.exists()) dir.mkdirs()
+                FileOutputStream(File(dir, fileName)).use { it.write(bytes) }
+            }
+
+            runOnUiThread {
+                val targetHint = if (isImage) "相册 (Pictures/Gemini)" else "下载目录 (Downloads)"
+                Toast.makeText(this, "已保存到 $targetHint：$fileName", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            runOnUiThread {
+                Toast.makeText(this, "写入文件失败：${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // ==================== 通用工具方法 ====================
 
     private fun buildSanitizedUserAgent(defaultUa: String): String {
         return defaultUa
@@ -392,6 +818,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        ioExecutor.shutdown()
         webView.destroy()
         super.onDestroy()
     }
