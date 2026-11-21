@@ -1,6 +1,0 @@
-<resources>
-    <style name="Theme.GeminiWebWrapper" parent="Theme.Material3.DayNight.NoActionBar">
-        <item name="android:colorBackground">@color/surface_light</item>
-        <item name="colorPrimary">@color/gemini_accent</item>
-    </style>
-</resources>
