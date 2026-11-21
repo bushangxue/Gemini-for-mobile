@@ -344,7 +344,7 @@ class MainActivity : AppCompatActivity() {
     private fun buildSanitizedUserAgent(defaultUa: String): String {
         return defaultUa
             .replace("; wv)", ")")
-            .replace(Regex("Version/\d+\.\d+\s*"), "")
+            .replace(Regex("""Version/\d+\.\d+\s*"""), "")
             .trim()
     }
 
